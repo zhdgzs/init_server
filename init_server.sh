@@ -180,10 +180,22 @@ maybe_init_docker() {
     require_command curl
     require_command bash
 
+    if command -v docker >/dev/null 2>&1; then
+        echo ">>> 检测到当前系统已安装 Docker，版本信息如下："
+        docker --version || true
+    else
+        echo ">>> 检测到当前系统未安装 Docker。"
+    fi
+
     echo ">>> 开始执行 Docker 在线安装脚本..."
     if ! bash <(curl -sSL "$DOCKER_INSTALL_SCRIPT_URL"); then
         echo "错误：Docker 在线安装脚本执行失败。"
         exit 1
+    fi
+
+    if command -v docker >/dev/null 2>&1; then
+        echo ">>> Docker 安装流程执行完成，当前版本："
+        docker --version || true
     fi
 }
 
@@ -216,6 +228,8 @@ maybe_install_1panel() {
         echo ">>> 检测到 1Panel 已安装，跳过安装步骤。"
         return 0
     fi
+
+    echo ">>> 检测到当前系统未安装 1Panel。"
 
     read -r -p "是否需要安装 1Panel ? (y/n): " install_reply
     if [[ ! "$install_reply" =~ ^[Yy]$ ]]; then
