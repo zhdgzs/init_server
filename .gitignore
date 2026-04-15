@@ -1,0 +1,9 @@
+.codex
+.omx/
+
+.DS_Store
+Thumbs.db
+
+*.swp
+*.swo
+*~
