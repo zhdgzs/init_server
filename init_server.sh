@@ -5,10 +5,11 @@ set -euo pipefail
 DEFAULT_SWAP_SIZE_GB=4
 DEFAULT_SWAP_FILE="/swapfile"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DOCKER_INIT_SCRIPT="${SCRIPT_DIR}/init_docker.sh"
-FIREWALL_DIR="$(cd "./firewall" && pwd)"
+FIREWALL_DIR="$(cd "${SCRIPT_DIR}/firewall" && pwd)"
 UBUNTU_FIREWALL_SCRIPT="${FIREWALL_DIR}/ubuntu_setup_firewall.sh"
 CENTOS_FIREWALL_SCRIPT="${FIREWALL_DIR}/centos_setup_firewall.sh"
+DOCKER_INSTALL_SCRIPT_URL="https://linuxmirrors.cn/docker.sh"
+ONEPANEL_INSTALL_SCRIPT_URL="https://resource.fit2cloud.com/1panel/package/v2/quick_start.sh"
 
 require_root() {
     if [ "$(id -u)" -ne 0 ]; then
@@ -170,19 +171,68 @@ enable_swap_if_needed() {
 maybe_init_docker() {
     local reply=""
 
-    if [ ! -f "$DOCKER_INIT_SCRIPT" ]; then
-        echo "错误：未找到 Docker 初始化脚本: $DOCKER_INIT_SCRIPT"
-        exit 1
-    fi
-
     read -r -p "是否需要初始化 Docker ? (y/n): " reply
     if [[ ! "$reply" =~ ^[Yy]$ ]]; then
         echo ">>> 跳过 Docker 初始化。"
         return 0
     fi
 
-    echo ">>> 开始执行 Docker 初始化脚本..."
-    bash "$DOCKER_INIT_SCRIPT"
+    require_command curl
+    require_command bash
+
+    echo ">>> 开始执行 Docker 在线安装脚本..."
+    if ! bash <(curl -sSL "$DOCKER_INSTALL_SCRIPT_URL"); then
+        echo "错误：Docker 在线安装脚本执行失败。"
+        exit 1
+    fi
+}
+
+is_1panel_installed() {
+    if command -v 1pctl >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if [ -x /usr/local/bin/1pctl ] || [ -x /usr/bin/1pctl ]; then
+        return 0
+    fi
+
+    if [ -d /opt/1panel ]; then
+        return 0
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl list-unit-files 2>/dev/null | grep -q '^1panel\.service'; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+maybe_install_1panel() {
+    local install_reply=""
+
+    if is_1panel_installed; then
+        echo ">>> 检测到 1Panel 已安装，跳过安装步骤。"
+        return 0
+    fi
+
+    read -r -p "是否需要安装 1Panel ? (y/n): " install_reply
+    if [[ ! "$install_reply" =~ ^[Yy]$ ]]; then
+        echo ">>> 跳过 1Panel 安装。"
+        return 0
+    fi
+
+    require_command curl
+    require_command bash
+
+    echo ">>> 正在按 1Panel V2 官方文档执行在线安装脚本..."
+    if ! bash -c "$(curl -sSL "$ONEPANEL_INSTALL_SCRIPT_URL")"; then
+        echo "错误：1Panel V2 官方安装脚本执行失败。"
+        exit 1
+    fi
+
+    echo ">>> 1Panel 安装脚本已执行完成。"
 }
 
 maybe_setup_firewall() {
@@ -211,6 +261,7 @@ main() {
 
     # 预留后续更多基础配置入口。
     maybe_init_docker
+    maybe_install_1panel
     maybe_setup_firewall
 
     echo "----------------------------------------"
