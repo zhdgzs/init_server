@@ -172,10 +172,28 @@ maybe_init_docker() {
     local reply=""
     local docker_installed="false"
 
+    print_docker_status() {
+        echo ">>> Docker 版本信息如下："
+        docker --version || true
+
+        if docker info >/dev/null 2>&1; then
+            echo ">>> Docker daemon 当前可用。"
+        else
+            echo ">>> Docker daemon 当前不可用或未启动。"
+        fi
+
+        if docker compose version >/dev/null 2>&1; then
+            echo ">>> Docker Compose 版本信息如下："
+            docker compose version || true
+        else
+            echo ">>> 未检测到 docker compose 子命令。"
+        fi
+    }
+
     if command -v docker >/dev/null 2>&1; then
         docker_installed="true"
-        echo ">>> 检测到当前系统已安装 Docker，版本信息如下："
-        docker --version || true
+        echo ">>> 检测到当前系统已安装 Docker。"
+        print_docker_status
     else
         echo ">>> 检测到当前系统未安装 Docker。"
     fi
@@ -201,8 +219,8 @@ maybe_init_docker() {
     fi
 
     if command -v docker >/dev/null 2>&1; then
-        echo ">>> Docker 安装流程执行完成，当前版本："
-        docker --version || true
+        echo ">>> Docker 安装流程执行完成。"
+        print_docker_status
     fi
 }
 
