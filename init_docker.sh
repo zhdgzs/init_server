@@ -14,6 +14,7 @@ PACKAGE_FAMILY=""
 APT_REPO_DIST=""
 RPM_REPO_DIST=""
 RPM_PACKAGE_MANAGER=""
+RPM_COMPAT_RELEASEVER=""
 INSTALLED_DOCKER_PACKAGES=()
 
 require_root() {
@@ -106,6 +107,62 @@ prompt_unknown_os_choice() {
     done
 }
 
+prompt_rpm_compat_releasever() {
+    local choice=""
+
+    echo ">>> 当前系统为 TencentOS，Docker CE 仓库需要指定兼容的 CentOS/RHEL 主版本。"
+    echo ">>> 请选择兼容版本："
+    echo "1) 8"
+    echo "2) 9"
+
+    while true; do
+        read -r -p "请输入选项 1 或 2 [默认 1]: " choice
+
+        if [ -z "$choice" ]; then
+            choice="1"
+        fi
+
+        case "$choice" in
+            1)
+                RPM_COMPAT_RELEASEVER="8"
+                return 0
+                ;;
+            2)
+                RPM_COMPAT_RELEASEVER="9"
+                return 0
+                ;;
+        esac
+
+        echo "输入无效，请重新输入。"
+    done
+}
+
+detect_tencentos_compat_releasever() {
+    local major_version=""
+    local reply=""
+
+    major_version="$(echo "${VERSION_ID:-}" | cut -d. -f1)"
+
+    case "$major_version" in
+        3)
+            echo ">>> 检测到 TencentOS Server 3.x，默认使用兼容版本 8。"
+            RPM_COMPAT_RELEASEVER="8"
+            ;;
+        4)
+            echo ">>> 检测到 TencentOS Server 4.x，通常优先兼容 EL8。"
+            read -r -p "是否使用兼容版本 8 ? (Y/n): " reply
+            if [[ ! "${reply:-}" =~ ^[Nn]$ ]]; then
+                RPM_COMPAT_RELEASEVER="8"
+            else
+                prompt_rpm_compat_releasever
+            fi
+            ;;
+        *)
+            prompt_rpm_compat_releasever
+            ;;
+    esac
+}
+
 detect_os() {
     echo ">>> 正在检测操作系统类型..."
 
@@ -142,9 +199,14 @@ detect_os() {
             PACKAGE_FAMILY="rpm"
             RPM_REPO_DIST="fedora"
             ;;
-        centos|rocky|almalinux|anolis|openanolis|opencloudos|alinux|alinux3|aliyun|tlinux|tencentos)
+        centos|rocky|almalinux|anolis|openanolis|opencloudos|alinux|alinux3|aliyun|tlinux)
             PACKAGE_FAMILY="rpm"
             RPM_REPO_DIST="centos"
+            ;;
+        tencentos)
+            PACKAGE_FAMILY="rpm"
+            RPM_REPO_DIST="centos"
+            detect_tencentos_compat_releasever
             ;;
         rhel|ol)
             PACKAGE_FAMILY="rpm"
@@ -162,6 +224,9 @@ detect_os() {
         detect_rpm_package_manager
         echo ">>> 安装策略: CentOS/RHEL 系，Docker CE 仓库类型: $RPM_REPO_DIST"
         echo ">>> 检测到 RPM 包管理器: $RPM_PACKAGE_MANAGER"
+        if [ -n "$RPM_COMPAT_RELEASEVER" ]; then
+            echo ">>> 指定 RPM 仓库兼容版本: $RPM_COMPAT_RELEASEVER"
+        fi
     fi
 }
 
@@ -223,10 +288,17 @@ configure_rpm_repo_file() {
     fi
 
     sed -i "s|https://download.docker.com|${DOCKER_CE_MIRROR_BASE}|g" "$repo_path"
+
+    if [ -n "$RPM_COMPAT_RELEASEVER" ]; then
+        sed -i "s|\$releasever|${RPM_COMPAT_RELEASEVER}|g" "$repo_path"
+        echo ">>> 已将 Docker RPM 仓库中的 \$releasever 固定为: ${RPM_COMPAT_RELEASEVER}"
+    fi
 }
 
 install_docker_rpm() {
     local repo_url="https://download.docker.com/linux/${RPM_REPO_DIST}/docker-ce.repo"
+    local install_cmd=()
+    local makecache_cmd=()
 
     echo ">>> 开始配置 RPM 仓库并安装 Docker..."
 
@@ -240,8 +312,19 @@ install_docker_rpm() {
         else
             dnf config-manager --add-repo "$repo_url"
         fi
+
         configure_rpm_repo_file /etc/yum.repos.d/docker-ce.repo
-        dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+        if [ -n "$RPM_COMPAT_RELEASEVER" ]; then
+            makecache_cmd=(dnf --releasever="$RPM_COMPAT_RELEASEVER" makecache)
+            install_cmd=(dnf --releasever="$RPM_COMPAT_RELEASEVER" install -y)
+        else
+            makecache_cmd=(dnf makecache)
+            install_cmd=(dnf install -y)
+        fi
+
+        "${makecache_cmd[@]}"
+        "${install_cmd[@]}" docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
         return 0
     fi
 
@@ -249,7 +332,14 @@ install_docker_rpm() {
     require_command yum-config-manager
     yum-config-manager --add-repo "$repo_url"
     configure_rpm_repo_file /etc/yum.repos.d/docker-ce.repo
-    yum install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+    if [ -n "$RPM_COMPAT_RELEASEVER" ]; then
+        yum --releasever="$RPM_COMPAT_RELEASEVER" makecache
+        yum --releasever="$RPM_COMPAT_RELEASEVER" install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    else
+        yum makecache
+        yum install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    fi
 }
 
 collect_installed_apt_docker_packages() {
@@ -312,9 +402,17 @@ uninstall_docker() {
 
     if [ "${#installed_packages[@]}" -gt 0 ]; then
         if [ "$RPM_PACKAGE_MANAGER" = "dnf" ]; then
-            dnf remove -y "${installed_packages[@]}"
+            if [ -n "$RPM_COMPAT_RELEASEVER" ]; then
+                dnf --releasever="$RPM_COMPAT_RELEASEVER" remove -y "${installed_packages[@]}"
+            else
+                dnf remove -y "${installed_packages[@]}"
+            fi
         else
-            yum remove -y "${installed_packages[@]}"
+            if [ -n "$RPM_COMPAT_RELEASEVER" ]; then
+                yum --releasever="$RPM_COMPAT_RELEASEVER" remove -y "${installed_packages[@]}"
+            else
+                yum remove -y "${installed_packages[@]}"
+            fi
         fi
     else
         echo ">>> 未检测到通过 ${RPM_PACKAGE_MANAGER} 安装的 Docker 相关软件包，跳过卸载包步骤。"
