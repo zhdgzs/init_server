@@ -170,8 +170,22 @@ enable_swap_if_needed() {
 
 maybe_init_docker() {
     local reply=""
+    local docker_installed="false"
 
-    read -r -p "是否需要初始化 Docker ? (y/n): " reply
+    if command -v docker >/dev/null 2>&1; then
+        docker_installed="true"
+        echo ">>> 检测到当前系统已安装 Docker，版本信息如下："
+        docker --version || true
+    else
+        echo ">>> 检测到当前系统未安装 Docker。"
+    fi
+
+    if [ "$docker_installed" = "true" ]; then
+        read -r -p "是否仍需执行 Docker 安装脚本 ? (y/n): " reply
+    else
+        read -r -p "是否需要安装 Docker ? (y/n): " reply
+    fi
+
     if [[ ! "$reply" =~ ^[Yy]$ ]]; then
         echo ">>> 跳过 Docker 初始化。"
         return 0
@@ -179,13 +193,6 @@ maybe_init_docker() {
 
     require_command curl
     require_command bash
-
-    if command -v docker >/dev/null 2>&1; then
-        echo ">>> 检测到当前系统已安装 Docker，版本信息如下："
-        docker --version || true
-    else
-        echo ">>> 检测到当前系统未安装 Docker。"
-    fi
 
     echo ">>> 开始执行 Docker 在线安装脚本..."
     if ! bash <(curl -sSL "$DOCKER_INSTALL_SCRIPT_URL"); then
