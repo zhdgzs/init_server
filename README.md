@@ -129,13 +129,36 @@ Ubuntu/Debian 会启用 UFW 的 IPv6 规则支持；目标系统需具备可用�
 test -e "edgeone.json" || install -m 0600 "edgeone.example.json" "edgeone.json"
 ```
 
-将三个空字段填写为实际值：
+将 `edgeone.json` 的三个空字段填写为实际值，保留 `edgeone.example.json` 中的空值作为公共模板：
 
-| JSON 字段 | 内容 |
-| --- | --- |
-| `zone_id` | 站点 ID，例如 `zone-xxxxxxxxxxxxxxxx`。 |
-| `secret_id` | 具有目标站点查询权限的腾讯云 SecretId。 |
-| `secret_key` | 对应的腾讯云 SecretKey。 |
+| JSON 字段 | 含义 | 从哪里获取 |
+| --- | --- | --- |
+| `zone_id` | 需要查询回源网段的 EdgeOne 站点唯一 ID，格式为 `zone-xxxxxxxxxxxxxxxx`。 | [EdgeOne 站点管理](https://console.cloud.tencent.com/edgeone/zones)中目标站点的站点 ID，或通过 `DescribeZones` 接口查询。 |
+| `secret_id` | 腾讯云 API 密钥对的身份标识，用于标识发起请求的账号。 | [访问管理 CAM → API 密钥管理](https://console.cloud.tencent.com/cam/capi)中密钥对的 `SecretId`。 |
+| `secret_key` | 与该 `SecretId` 配对的密钥，用于计算 API 请求签名。 | 同一条 API 密钥记录的 `SecretKey`，创建密钥时按页面提示查看或保存。 |
+
+### 获取站点 ID：`zone_id`
+
+1. 登录 [EdgeOne 控制台的站点管理页面](https://console.cloud.tencent.com/edgeone/zones)。
+2. 找到使用当前服务器作为源站的站点，进入站点详情或概览，查看并复制以 `zone-` 开头的站点 ID。
+3. 将完整 ID 填入 `zone_id`。这里填写的是站点 ID，不是域名、CNAME、源站 IP、腾讯云 AppId 或套餐 ID。
+
+如果控制台页面未直接显示站点 ID，可打开 [API Explorer 的 DescribeZones 接口](https://console.cloud.tencent.com/api/explorer?Product=teo&Version=2022-09-01&Action=DescribeZones)，
+使用具有站点查询权限的账号查询站点列表，在返回的 `Zones` 中按 `ZoneName` 找到目标站点，复制对应的 `ZoneId`。
+通过此方式查询还需具有 `teo:DescribeZones` 权限；脚本日常更新只调用 `DescribeOriginACL`。
+
+### 获取 API 密钥：`secret_id` 和 `secret_key`
+
+1. 打开腾讯云 [API 密钥管理](https://console.cloud.tencent.com/cam/capi)。建议在 CAM 中为专用子用户创建或管理密钥，并授权其访问目标 EdgeOne 站点。
+2. 使用一对有效密钥，或通过页面的“新建密钥”创建一对；子用户的密钥管理权限不足时，需要由账号管理员操作。
+3. 将同一对密钥的 `SecretId` 和 `SecretKey` 分别填入 `secret_id` 和 `secret_key`，不要混用不同密钥对中的值。
+4. 如果已有密钥的 `SecretKey` 无法查看且没有保存，应创建新的密钥对，并同时更新这两个字段。
+
+这是腾讯云 API 访问密钥，不是腾讯云登录密码、EdgeOne 回源鉴权密钥或 HTTPS 证书私钥。
+密钥所属账号必须有目标站点的 `teo:DescribeOriginACL` 权限；对应站点及回源域名/四层实例也需已启用“源站防护”。
+仅创建 API 密钥不会自动授予站点权限，也不会自动开启源站防护。
+
+### 保存与更新
 
 `.gitignore` 已忽略根目录的 `/edgeone.json`，仅提交不含真实凭据的 `edgeone.example.json`。
 启用 EdgeOne 时会校验文件及字段并将文件权限设为 `0600`；文件缺失、字段为空或格式错误会中止配置。
