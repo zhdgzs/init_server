@@ -7,3 +7,6 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# 本机 EdgeOne 凭据，不提交真实密钥。
+/edgeone.json
