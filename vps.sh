@@ -18,6 +18,8 @@ rules_dir=/etc/vps-firewall
 ports_file=$rules_dir/ports.list
 rules_file=$rules_dir/rules.nft
 unit_file=/etc/systemd/system/vps-firewall.service
+# Debian 归档签名密钥，写 deb822 源时引用。
+apt_keyring=/usr/share/keyrings/debian-archive-keyring.gpg
 
 ssh_service_name() {
     if systemctl list-unit-files sshd.service --no-legend | grep -q '^sshd.service'; then
@@ -164,27 +166,73 @@ enable_firewall() (
     printf '请保留当前 SSH 会话并另开连接验证。\n'
 )
 
-# 新系统常常没有 ca-certificates，https 源会直接卡在证书校验；用现有源先补上。
-ensure_ca_certificates() (
-    set -e -o pipefail
-    if dpkg-query -W -f='${Status}' ca-certificates 2>/dev/null | grep -q 'install ok installed'; then
-        return 0
-    fi
-    printf '检测到缺少 ca-certificates，先用当前源安装（https 镜像需要 CA 证书）。\n'
-    apt-get -o DPkg::Lock::Timeout=120 update
-    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y ca-certificates
-)
+# 生成 deb822 源内容：参数是版本代号和协议（https / http）。
+render_apt_sources() {
+    cat <<SOURCES
+Types: deb
+URIs: $2://mirrors.tuna.tsinghua.edu.cn/debian
+Suites: $1 $1-updates $1-backports
+Components: main contrib non-free non-free-firmware
+Signed-By: $apt_keyring
 
-# 把 APT 源换成清华镜像；验证失败则整体回退，不留下半成品配置。
+Types: deb
+URIs: $2://security.debian.org/debian-security
+Suites: $1-security
+Components: main contrib non-free non-free-firmware
+Signed-By: $apt_keyring
+SOURCES
+}
+
+# 经典格式的 sources.list 里还有生效的源定义。
+legacy_sources_active() {
+    [[ -f "$1" ]] && grep -qE '^[[:space:]]*(deb(-src)?[[:space:]]|Types:)' "$1"
+}
+
+# 写入 debian.sources；原文件只在首次运行时备份，重复运行不会覆盖原件。
+apt_install_sources() {
+    for file in "$legacy" "$mirror_file"; do
+        if [[ -f "$file" && ! -e "$file.vps.bak" ]]; then cp -p "$file" "$file.vps.bak"; fi
+    done
+    mkdir -p "${mirror_file%/*}"
+    install -m 644 "$1" "$mirror_file"
+}
+
+# 经典格式的 sources.list 里有生效源定义就整体停用，避免和 deb822 重复。
+apt_disable_legacy() {
+    if legacy_sources_active "$legacy"; then
+        printf '# 由 vps.sh 停用，原内容见 %s.vps.bak\n' "$legacy" > "$legacy"
+        legacy_changed=yes
+    fi
+}
+
+# apt-get update 双重判定：非零退出或出现致命行都算失败，日志留在 $log。
+apt_update_ok() {
+    if ! log=$(apt-get update 2>&1); then return 1; fi
+    if grep -qE '^(E:|Err:|W: Failed to fetch)' <<< "$log"; then return 1; fi
+    return 0
+}
+
+# 还原两个文件和包索引。
+apt_rollback() {
+    if [[ "$legacy_changed" == yes ]]; then
+        if [[ -f "$legacy.vps.bak" ]]; then cp -p "$legacy.vps.bak" "$legacy"; else rm -f "$legacy"; fi
+    fi
+    if [[ -f "$mirror_file.vps.bak" ]]; then
+        cp -p "$mirror_file.vps.bak" "$mirror_file"
+    else
+        rm -f "$mirror_file"
+    fi
+    apt-get update >/dev/null 2>&1 || printf '恢复后 apt-get update 仍未成功，请检查网络。\n' >&2
+}
+
+# 把 APT 源换成清华镜像；缺 CA 时先用 http 镜像引导，验证失败则整体回退。
 setup_apt_mirror() (
     set -e -o pipefail
-    keyring=/usr/share/keyrings/debian-archive-keyring.gpg
     legacy=/etc/apt/sources.list
     mirror_file=/etc/apt/sources.list.d/debian.sources
     legacy_changed=no
-    failed=no
     log=''
-    mirror_scheme=https
+    ca_ready=no
 
     command -v apt-get >/dev/null || { printf '未找到 apt-get，本选项仅支持 Debian。\n' >&2; exit 1; }
     [[ -r /etc/os-release ]] || { printf '无法读取 /etc/os-release。\n' >&2; exit 1; }
@@ -196,68 +244,66 @@ setup_apt_mirror() (
         exit 1
     }
     codename=$VERSION_CODENAME
-    [[ -f "$keyring" ]] || { printf '缺少 %s，请先安装 debian-archive-keyring。\n' "$keyring" >&2; exit 1; }
+    [[ -f "$apt_keyring" ]] || { printf '缺少 %s，请先安装 debian-archive-keyring。\n' "$apt_keyring" >&2; exit 1; }
 
-    # 必须在写 https 源之前完成：那时 apt 还能用发行版自带的 http 源。
-    if ! ensure_ca_certificates; then
-        mirror_scheme=http
-        printf '无法安装 ca-certificates，本次使用 http 镜像；apt 仍按签名校验软件包。\n' >&2
-        printf '之后装好 ca-certificates 可重跑本选项切回 https。\n' >&2
-    fi
-
-    printf '将把 APT 源替换为清华镜像（Debian %s）：\n' "$codename"
-    printf '  deb       %s://mirrors.tuna.tsinghua.edu.cn/debian\n' "$mirror_scheme"
-    printf '  security  %s://security.debian.org/debian-security\n' "$mirror_scheme"
-    printf '原配置备份为 <文件>.vps.bak，仅首次运行保存。\n'
-
+    umask 077
     work=$(mktemp -d)
     trap 'rm -rf "$work"' EXIT
-    umask 077
-    cat > "$work/debian.sources" <<SOURCES
-Types: deb
-URIs: $mirror_scheme://mirrors.tuna.tsinghua.edu.cn/debian
-Suites: $codename $codename-updates $codename-backports
-Components: main contrib non-free non-free-firmware
-Signed-By: $keyring
+    render_apt_sources "$codename" https > "$work/https"
+    render_apt_sources "$codename" http > "$work/http"
 
-Types: deb
-URIs: $mirror_scheme://security.debian.org/debian-security
-Suites: $codename-security
-Components: main contrib non-free non-free-firmware
-Signed-By: $keyring
-SOURCES
-
-    for file in "$legacy" "$mirror_file"; do
-        if [[ -f "$file" && ! -e "$file.vps.bak" ]]; then cp -p "$file" "$file.vps.bak"; fi
-    done
-    mkdir -p "${mirror_file%/*}"
-    install -m 644 "$work/debian.sources" "$mirror_file"
-
-    # 经典格式的 sources.list 会和新文件重复，整体停用（已有备份可恢复）。
-    if [[ -f "$legacy" ]] && grep -qE '^[[:space:]]*(deb(-src)?[[:space:]]|Types:)' "$legacy"; then
-        printf '# 由 vps.sh 停用，原内容见 %s.vps.bak\n' "$legacy" > "$legacy"
-        legacy_changed=yes
+    # 已经是完全一致的目标配置就什么都不做，避免重复备份和重复 update。
+    if cmp -s "$work/https" "$mirror_file" && ! legacy_sources_active "$legacy"; then
+        printf 'APT 源已经是清华镜像（Debian %s），无需替换。\n' "$codename"
+        return 0
     fi
 
-    printf '正在验证镜像源...\n'
-    if ! log=$(apt-get update 2>&1); then failed=yes; fi
-    if grep -qE '^(E:|Err:|W: Failed to fetch)' <<< "$log"; then failed=yes; fi
+    if dpkg-query -W -f='${Status}' ca-certificates 2>/dev/null | grep -q 'install ok installed'; then
+        ca_ready=yes
+    fi
+    printf '原配置备份为 <文件>.vps.bak（仅首次保存）。\n'
 
-    if [[ "$failed" == yes ]]; then
+    # 缺 CA 时用清华 http 做引导：旧官方源在国内同样慢，没必要绕它。
+    if [[ "$ca_ready" == no ]]; then
+        printf '缺少 ca-certificates：先切到清华 http 镜像，装好 CA 再升级到 https。\n'
+        apt_install_sources "$work/http"
+        apt_disable_legacy
+        if ! apt_update_ok; then
+            printf '%s\n' "$log" >&2
+            apt_rollback
+            printf 'http 镜像验证失败，已恢复原配置。\n' >&2
+            exit 1
+        fi
+        printf '正在从镜像安装 ca-certificates...\n'
+        if ! DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y ca-certificates; then
+            printf 'ca-certificates 安装失败，保留已验证可用的 http 镜像。\n' >&2
+            printf 'APT 源已切换到清华 http 镜像（Debian %s），软件包列表已更新。\n' "$codename"
+            exit 0
+        fi
+    fi
+
+    printf '正在写入 https 镜像并验证...\n'
+    apt_install_sources "$work/https"
+    apt_disable_legacy
+    if ! apt_update_ok; then
         printf '%s\n' "$log" >&2
-        if [[ "$legacy_changed" == yes ]]; then
-            if [[ -f "$legacy.vps.bak" ]]; then cp -p "$legacy.vps.bak" "$legacy"; else rm -f "$legacy"; fi
+        if [[ "$ca_ready" == yes ]]; then
+            apt_rollback
+            printf '镜像源验证失败，已恢复原配置。\n' >&2
+            exit 1
         fi
-        if [[ -f "$mirror_file.vps.bak" ]]; then
-            cp -p "$mirror_file.vps.bak" "$mirror_file"
-        else
-            rm -f "$mirror_file"
+        # http 刚验证过，用它兜底，别退回慢速官方源。
+        apt_install_sources "$work/http"
+        if apt_update_ok; then
+            printf 'https 镜像验证失败，已回退到 http 镜像。\n' >&2
+            exit 0
         fi
-        apt-get update >/dev/null 2>&1 || printf '恢复后 apt-get update 仍未成功，请检查网络。\n' >&2
-        printf '镜像源验证失败，已恢复原配置。\n' >&2
+        printf '%s\n' "$log" >&2
+        apt_rollback
+        printf 'https / http 镜像均验证失败，已恢复原配置。\n' >&2
         exit 1
     fi
-    printf 'APT 源已切换到清华镜像，软件包列表已更新。\n'
+    printf 'APT 源已切换到清华镜像（Debian %s，https），软件包列表已更新。\n' "$codename"
 )
 
 # 精简系统补齐常用工具：先更新索引，只安装缺失的包。
