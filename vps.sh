@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# VPS 工具：Root SSH 登录、SSH 端口、防火墙、Swap、标准 BBR、状态探针。
-# 适用于使用 systemd 的 Debian/Ubuntu；支持 curl -fsSL URL | sudo bash。
+# VPS 工具：APT 国内镜像、Root SSH 登录、SSH 端口、nftables 防火墙、Swap、标准 BBR、状态探针。
+# 适用于使用 systemd 且内核带 nft 的 Debian 11+ / Ubuntu 20.04+；支持 curl -fsSL URL | sudo bash。
 
 if (( EUID != 0 )); then
     printf '请使用 root 权限运行。\n' >&2
@@ -13,6 +13,12 @@ if ! { exec 3<>/dev/tty; } 2>/dev/null; then
     exit 1
 fi
 
+# 防火墙状态目录：ports.list 是唯一数据源，rules.nft 由它生成。
+rules_dir=/etc/vps-firewall
+ports_file=$rules_dir/ports.list
+rules_file=$rules_dir/rules.nft
+unit_file=/etc/systemd/system/vps-firewall.service
+
 ssh_service_name() {
     if systemctl list-unit-files sshd.service --no-legend | grep -q '^sshd.service'; then
         printf 'sshd\n'
@@ -23,7 +29,7 @@ ssh_service_name() {
 
 confirm_firewall_change() {
     local answer
-    printf '\n⚠️ 危险操作检测！\n操作类型：%s\n影响范围：本机 iptables / ip6tables 入站规则（IPv4 / IPv6）及开机恢复服务。\n风险评估：%s\n' "$1" "$2"
+    printf '\n⚠️ 危险操作检测！\n操作类型：%s\n影响范围：本机 nftables 「inet vps」 规则表（IPv4 / IPv6）及开机恢复服务。\n风险评估：%s\n' "$1" "$2"
     IFS= read -r -u 3 -p '请确认是否继续？[是/确认/继续，其他输入取消]: ' answer || return 1
     [[ "$answer" == 是 || "$answer" == 确认 || "$answer" == 继续 ]]
 }
@@ -61,129 +67,36 @@ detect_ssh_ports() (
     printf '%s\n' "$ports"
 )
 
-# 只管理自己的入站链，保留 OUTPUT、FORWARD、NAT 及其他自定义链。
+# 只声明自己的 table，其他工具（Docker、面板）的 table 不受影响。
 render_firewall_rules() {
-    local family=$1 port
-    cat <<'RULES'
-*filter
-:VPS_INPUT - [0:0]
--F VPS_INPUT
--A VPS_INPUT -i lo -j ACCEPT
--A VPS_INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
--A VPS_INPUT -m conntrack --ctstate INVALID -j DROP
-# 端口规则
-RULES
-    if [[ "$family" == 4 ]]; then
-        printf '%s\n' '-A VPS_INPUT -p icmp -j ACCEPT' \
-            '-A VPS_INPUT -p udp --sport 67 --dport 68 -j ACCEPT'
-    else
-        printf '%s\n' '-A VPS_INPUT -p ipv6-icmp -j ACCEPT' \
-            '-A VPS_INPUT -s fe80::/10 -p udp --sport 547 --dport 546 -j ACCEPT'
+    cat <<'NFT'
+# 由 vps.sh 生成，请勿手工修改。
+table inet vps {
+    chain input {
+        type filter hook input priority -10; policy drop;
+        iif lo accept
+        ct state established,related accept
+        ct state invalid drop
+        meta l4proto icmp accept
+        meta l4proto ipv6-icmp accept
+        udp sport 67 udp dport 68 accept
+        ip6 saddr fe80::/10 udp sport 547 udp dport 546 accept
+NFT
+    if [[ -n "$1" ]]; then
+        printf '        tcp dport { %s } accept\n' "$(printf '%s\n' "$1" | paste -sd,)"
     fi
-    printf '%s\n' '-A VPS_INPUT -p tcp --dport 443 -j ACCEPT'
-    while IFS= read -r port; do
-        [[ "$port" == 443 ]] && continue
-        printf '%s\n' "-A VPS_INPUT -p tcp --dport $port -j ACCEPT"
-    done <<< "$2"
-    printf '%s\n' '-A VPS_INPUT -j DROP' 'COMMIT'
+    printf '    }\n}\n'
 }
 
-# 在同一次提交内移除旧入口并置顶，避免重复运行累积跳转规则。
-prepare_firewall_restore() {
-    sed '$d' "$1"
-    awk '$0 == "-A INPUT -j VPS_INPUT" {print "-D INPUT -j VPS_INPUT"}' "$2"
-    printf '%s\n' '-I INPUT 1 -j VPS_INPUT' 'COMMIT'
+read_allowed_ports() {
+    [[ -f "$ports_file" ]] || return 0
+    awk '$1 ~ /^[0-9]+$/ && $1 + 0 >= 1 && $1 + 0 <= 65535 {print $1 + 0}' "$ports_file" | sort -n -u
 }
 
-# 同时供菜单和开机服务使用；IPv4 / IPv6 不能跨协议族原子提交，失败时回滚。
-restore_firewall_rules() (
-    set -e -o pipefail
-    rules_dir=$1
-    work=$(mktemp -d)
-    live_changed=no
-    trap '
-        status=$?
-        if (( status != 0 )) && [[ "$live_changed" == yes ]]; then
-            iptables-restore --wait 5 < "$work/old.v4" || printf "恢复 IPv4 失败。\n" >&2
-            ip6tables-restore --wait 5 < "$work/old.v6" || printf "恢复 IPv6 失败。\n" >&2
-        fi
-        if (( status == 0 )); then
-            rm -rf "$work"
-        else
-            printf "防火墙恢复材料保留在：%s\n" "$work" >&2
-        fi
-    ' EXIT
-    iptables-save -t filter > "$work/old.v4"
-    ip6tables-save -t filter > "$work/old.v6"
-    for family in 4 6; do
-        [[ "$(tail -n 1 "$rules_dir/rules.v$family")" == COMMIT ]]
-        prepare_firewall_restore "$rules_dir/rules.v$family" "$work/old.v$family" > "$work/new.v$family"
-    done
-    iptables-restore --wait 5 --test --noflush < "$work/new.v4"
-    ip6tables-restore --wait 5 --test --noflush < "$work/new.v6"
-    iptables-restore --wait 5 --noflush < "$work/new.v4"
-    live_changed=yes
-    ip6tables-restore --wait 5 --noflush < "$work/new.v6"
-)
-
-# 三个入口共用持久化和回滚，避免运行规则与开机配置不一致。
-apply_firewall_rules() (
-    set -e -o pipefail
-    candidate=$1
-    rules_dir=/etc/vps-firewall
-    unit_file=/etc/systemd/system/vps-firewall.service
-    umask 077
-    backup=$(mktemp -d "/etc/vps-firewall-backup.XXXXXX")
-    iptables-save -t filter > "$backup/live.v4"
-    ip6tables-save -t filter > "$backup/live.v6"
-    for file in rules.v4 rules.v6 restore.sh; do
-        if [[ -f "$rules_dir/$file" ]]; then cp -p "$rules_dir/$file" "$backup/$file"; fi
-    done
-    unit_existed=no was_enabled=no live_changed=no files_changed=no
-    if [[ -f "$unit_file" ]]; then cp -p "$unit_file" "$backup/service"; unit_existed=yes; fi
-    if systemctl is-enabled --quiet vps-firewall.service; then was_enabled=yes; fi
-    trap '
-        status=$?
-        if (( status != 0 )); then
-            restored=yes
-            if [[ "$live_changed" == yes ]]; then
-                iptables-restore --wait 5 < "$backup/live.v4" || restored=no
-                ip6tables-restore --wait 5 < "$backup/live.v6" || restored=no
-            fi
-            if [[ "$files_changed" == yes ]]; then
-                if [[ "$was_enabled" == no ]]; then systemctl disable vps-firewall.service || restored=no; fi
-                for file in rules.v4 rules.v6 restore.sh; do
-                    if [[ -f "$backup/$file" ]]; then
-                        cp -p "$backup/$file" "$rules_dir/$file" || restored=no
-                    else
-                        rm -f "$rules_dir/$file" || restored=no
-                    fi
-                done
-                if [[ "$unit_existed" == yes ]]; then
-                    cp -p "$backup/service" "$unit_file" || restored=no
-                else
-                    rm -f "$unit_file" || restored=no
-                fi
-                systemctl daemon-reload || restored=no
-            fi
-            printf "防火墙配置失败，原配置恢复结果：%s；备份：%s\n" "$restored" "$backup" >&2
-        fi
-    ' EXIT
-    restore_firewall_rules "$candidate"
-    live_changed=yes
-    files_changed=yes
-    mkdir -p "$rules_dir"
-    install -m 600 "$candidate/rules.v4" "$rules_dir/rules.v4"
-    install -m 600 "$candidate/rules.v6" "$rules_dir/rules.v6"
-    {
-        printf '#!/usr/bin/env bash\nset -e -o pipefail\nPATH=/usr/sbin:/usr/bin:/sbin:/bin\n'
-        declare -f prepare_firewall_restore restore_firewall_rules
-        printf 'restore_firewall_rules /etc/vps-firewall\n'
-    } > "$rules_dir/restore.sh"
-    chmod 700 "$rules_dir/restore.sh"
+write_firewall_unit() {
     cat > "$unit_file" <<UNIT
 [Unit]
-Description=VPS iptables firewall
+Description=VPS nftables firewall
 DefaultDependencies=no
 After=local-fs.target
 Before=network-pre.target shutdown.target
@@ -193,16 +106,39 @@ Conflicts=shutdown.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/bash $rules_dir/restore.sh
-ExecReload=/bin/bash $rules_dir/restore.sh
+ExecStartPre=-/usr/sbin/nft delete table inet vps
+ExecStart=/usr/sbin/nft -f $rules_file
 
 [Install]
 WantedBy=multi-user.target
 UNIT
     chmod 644 "$unit_file"
+}
+
+# 先校验再原子替换：失败时 live 规则和落盘文件都保持原样，无需回滚逻辑。
+apply_firewall_rules() (
+    set -e -o pipefail
+    ports=$(printf '%s\n' "$1" | awk '$1 ~ /^[0-9]+$/ && $1 + 0 >= 1 && $1 + 0 <= 65535 {print $1 + 0}' | sort -n -u)
+    [[ -n "$ports" ]] || { printf '端口列表为空，停止操作以免全部入站被丢弃。\n' >&2; exit 1; }
+    umask 077
+    mkdir -p "$rules_dir"
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' EXIT
+    render_firewall_rules "$ports" > "$work/rules.nft"
+    # 删除旧 table 与加载新 table 在同一次提交内完成，中间不存在空窗。
+    if nft list table inet vps >/dev/null 2>&1; then
+        { printf 'delete table inet vps\n'; cat "$work/rules.nft"; } > "$work/apply.nft"
+    else
+        cp "$work/rules.nft" "$work/apply.nft"
+    fi
+    nft -c -f "$work/apply.nft"
+    nft -f "$work/apply.nft"
+    printf '%s\n' "$ports" > "$work/ports.list"
+    install -m 600 "$work/ports.list" "$ports_file"
+    install -m 600 "$work/rules.nft" "$rules_file"
+    write_firewall_unit
     systemctl daemon-reload
     systemctl enable vps-firewall.service
-    printf 'iptables 规则已应用并设置开机恢复；原配置备份：%s\n' "$backup"
 )
 
 enable_firewall() (
@@ -214,72 +150,141 @@ enable_firewall() (
             exit 1
         fi
     done
-    if [[ -f /etc/vps-firewall/rules.nft ]]; then
-        printf '检测到旧版 nftables 配置，请先停用并迁移旧规则，避免两套规则同时生效。\n' >&2
-        exit 1
-    fi
     printf '将放行 TCP 443 和以下 SSH TCP 端口：\n%s\n' "$ssh_ports"
     printf '其他本机新入站端口（包括 80）将被关闭；保留回环、已有连接、ICMP 和 DHCP。\n'
-    printf '本脚本入站链优先于已有 INPUT 规则；出站、转发、Docker 映射端口及云安全组需另行管理。\n'
-    confirm_firewall_change '启用 iptables / ip6tables 防火墙（缺少命令时安装 iptables）' \
-        '替换本脚本入站链，其他入站服务将无法新建连接；重复启用会恢复 443 放行。' || exit 0
-    missing=no
-    for tool in iptables ip6tables iptables-save ip6tables-save iptables-restore ip6tables-restore; do
-        command -v "$tool" >/dev/null || missing=yes
-    done
-    if [[ "$missing" == yes ]]; then
+    printf '本脚本只写自己的 table，出站、转发、Docker 映射端口及云安全组需另行管理。\n'
+    confirm_firewall_change '启用 nftables 防火墙（缺少 nft 时安装 nftables）' \
+        '规则表为默认丢弃，其他入站服务将无法新建连接；重复启用不会累积规则。' || exit 0
+    if ! command -v nft >/dev/null; then
         apt-get update
-        apt-get install -y iptables
+        apt-get install -y nftables
     fi
-    candidate=$(mktemp -d)
-    trap 'rm -rf "$candidate"' EXIT
-    render_firewall_rules 4 "$ssh_ports" > "$candidate/rules.v4"
-    render_firewall_rules 6 "$ssh_ports" > "$candidate/rules.v6"
-    apply_firewall_rules "$candidate"
+    apply_firewall_rules "$(printf '443\n%s\n' "$ssh_ports")"
+    printf '规则已写入 %s 并设置开机恢复。\n' "$rules_file"
     printf '请保留当前 SSH 会话并另开连接验证。\n'
 )
 
-# 将新的端口动作放在已有端口规则之前，但保留已建立连接和回环流量。
-update_firewall_port() (
+# 新系统常常没有 ca-certificates，https 源会直接卡在证书校验；用现有源先补上。
+ensure_ca_certificates() (
     set -e -o pipefail
-    port=$1 action=$2
-    candidate=$(mktemp -d)
-    trap 'rm -rf "$candidate"' EXIT
-    [[ "$port" =~ ^[0-9]{1,5}$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 ))
-    [[ "$action" == ACCEPT || "$action" == DROP ]]
-    for family in 4 6; do
-        grep -qx '# 端口规则' "/etc/vps-firewall/rules.v$family"
-        awk -v port="$port" -v action="$action" '
-            $1 == "-A" && $2 == "VPS_INPUT" && $5 == "--dport" && $6 == port && $8 == action {next}
-            {print}
-            $0 == "# 端口规则" {
-                print "-A VPS_INPUT -p tcp --dport " port " -j " action
-                if (action == "DROP") print "-A VPS_INPUT -p udp --dport " port " -j DROP"
-            }
-        ' "/etc/vps-firewall/rules.v$family" > "$candidate/rules.v$family"
-    done
-    apply_firewall_rules "$candidate"
+    if dpkg-query -W -f='${Status}' ca-certificates 2>/dev/null | grep -q 'install ok installed'; then
+        return 0
+    fi
+    printf '检测到缺少 ca-certificates，先用当前源安装（https 镜像需要 CA 证书）。\n'
+    apt-get -o DPkg::Lock::Timeout=120 update
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y ca-certificates
 )
 
-close_firewall_port() (
+# 把 APT 源换成清华镜像；验证失败则整体回退，不留下半成品配置。
+setup_apt_mirror() (
     set -e -o pipefail
-    [[ -f /etc/vps-firewall/rules.v4 && -f /etc/vps-firewall/rules.v6 ]] || {
-        printf '请先使用菜单 4 启用防火墙。\n'; exit 1;
+    keyring=/usr/share/keyrings/debian-archive-keyring.gpg
+    legacy=/etc/apt/sources.list
+    mirror_file=/etc/apt/sources.list.d/debian.sources
+    legacy_changed=no
+    failed=no
+    log=''
+    mirror_scheme=https
+
+    command -v apt-get >/dev/null || { printf '未找到 apt-get，本选项仅支持 Debian。\n' >&2; exit 1; }
+    [[ -r /etc/os-release ]] || { printf '无法读取 /etc/os-release。\n' >&2; exit 1; }
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    [[ "${ID:-}" == debian ]] || { printf '当前系统 ID=%s，本选项只处理 Debian。\n' "${ID:-未知}" >&2; exit 1; }
+    [[ "${VERSION_CODENAME:-}" =~ ^[a-z][a-z0-9-]*$ ]] || {
+        printf '无法从 /etc/os-release 取得版本代号，停止操作。\n' >&2
+        exit 1
     }
-    iptables --wait 5 -C INPUT -j VPS_INPUT
-    ip6tables --wait 5 -C INPUT -j VPS_INPUT
-    ssh_ports=$(detect_ssh_ports)
-    IFS= read -r -u 3 -p '请输入要关闭的端口（1-65535，同时阻止 TCP / UDP）: ' port
-    [[ "$port" =~ ^[0-9]{1,5}$ ]] || { printf '端口必须是 1-65535 的整数。\n'; exit 1; }
-    port=$((10#$port))
-    (( port >= 1 && port <= 65535 )) || { printf '端口必须在 1-65535 范围内。\n'; exit 1; }
-    while IFS= read -r ssh_port; do
-        [[ "$port" != "$ssh_port" ]] || { printf '端口 %s 用于 SSH，拒绝关闭以免失联。\n' "$port" >&2; exit 1; }
-    done <<< "$ssh_ports"
-    confirm_firewall_change "关闭入站端口 $port（TCP / UDP）" \
-        '该端口将拒绝新的入站连接，已有连接继续；Docker 映射端口需单独管理。' || exit 0
-    update_firewall_port "$port" DROP
-    printf '已关闭端口 %s 的新入站连接。\n' "$port"
+    codename=$VERSION_CODENAME
+    [[ -f "$keyring" ]] || { printf '缺少 %s，请先安装 debian-archive-keyring。\n' "$keyring" >&2; exit 1; }
+
+    # 必须在写 https 源之前完成：那时 apt 还能用发行版自带的 http 源。
+    if ! ensure_ca_certificates; then
+        mirror_scheme=http
+        printf '无法安装 ca-certificates，本次使用 http 镜像；apt 仍按签名校验软件包。\n' >&2
+        printf '之后装好 ca-certificates 可重跑本选项切回 https。\n' >&2
+    fi
+
+    printf '将把 APT 源替换为清华镜像（Debian %s）：\n' "$codename"
+    printf '  deb       %s://mirrors.tuna.tsinghua.edu.cn/debian\n' "$mirror_scheme"
+    printf '  security  %s://security.debian.org/debian-security\n' "$mirror_scheme"
+    printf '原配置备份为 <文件>.vps.bak，仅首次运行保存。\n'
+
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' EXIT
+    umask 077
+    cat > "$work/debian.sources" <<SOURCES
+Types: deb
+URIs: $mirror_scheme://mirrors.tuna.tsinghua.edu.cn/debian
+Suites: $codename $codename-updates $codename-backports
+Components: main contrib non-free non-free-firmware
+Signed-By: $keyring
+
+Types: deb
+URIs: $mirror_scheme://security.debian.org/debian-security
+Suites: $codename-security
+Components: main contrib non-free non-free-firmware
+Signed-By: $keyring
+SOURCES
+
+    for file in "$legacy" "$mirror_file"; do
+        if [[ -f "$file" && ! -e "$file.vps.bak" ]]; then cp -p "$file" "$file.vps.bak"; fi
+    done
+    mkdir -p "${mirror_file%/*}"
+    install -m 644 "$work/debian.sources" "$mirror_file"
+
+    # 经典格式的 sources.list 会和新文件重复，整体停用（已有备份可恢复）。
+    if [[ -f "$legacy" ]] && grep -qE '^[[:space:]]*(deb(-src)?[[:space:]]|Types:)' "$legacy"; then
+        printf '# 由 vps.sh 停用，原内容见 %s.vps.bak\n' "$legacy" > "$legacy"
+        legacy_changed=yes
+    fi
+
+    printf '正在验证镜像源...\n'
+    if ! log=$(apt-get update 2>&1); then failed=yes; fi
+    if grep -qE '^(E:|Err:|W: Failed to fetch)' <<< "$log"; then failed=yes; fi
+
+    if [[ "$failed" == yes ]]; then
+        printf '%s\n' "$log" >&2
+        if [[ "$legacy_changed" == yes ]]; then
+            if [[ -f "$legacy.vps.bak" ]]; then cp -p "$legacy.vps.bak" "$legacy"; else rm -f "$legacy"; fi
+        fi
+        if [[ -f "$mirror_file.vps.bak" ]]; then
+            cp -p "$mirror_file.vps.bak" "$mirror_file"
+        else
+            rm -f "$mirror_file"
+        fi
+        apt-get update >/dev/null 2>&1 || printf '恢复后 apt-get update 仍未成功，请检查网络。\n' >&2
+        printf '镜像源验证失败，已恢复原配置。\n' >&2
+        exit 1
+    fi
+    printf 'APT 源已切换到清华镜像，软件包列表已更新。\n'
+)
+
+# 精简系统补齐常用工具：先更新索引，只安装缺失的包。
+install_base_packages() (
+    set -e -o pipefail
+    packages=(curl wget git sudo ca-certificates unzip zip tar gzip bash-completion openssh-client gnupg)
+    missing=()
+
+    command -v apt-get >/dev/null || { printf '未找到 apt-get，本选项仅支持 Debian / Ubuntu。\n' >&2; exit 1; }
+    command -v dpkg-query >/dev/null || { printf '未找到 dpkg-query，系统环境异常。\n' >&2; exit 1; }
+
+    for pkg in "${packages[@]}"; do
+        dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'install ok installed' || missing+=("$pkg")
+    done
+    if (( ${#missing[@]} == 0 )); then
+        printf '基础包已全部安装，无需操作。\n'
+        return 0
+    fi
+    printf '将更新索引并安装 %d 个缺失的基础包：\n%s\n' "${#missing[@]}" "${missing[*]}"
+
+    # DPkg::Lock::Timeout：新系统首次启动时 apt 可能正被自动更新占用。
+    if ! apt-get -o DPkg::Lock::Timeout=120 update; then
+        printf 'apt-get update 失败；若是 https 源缺少 CA 证书，请先运行菜单 1。\n' >&2
+        exit 1
+    fi
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y "${missing[@]}"
+    printf '基础包安装完成：%s\n' "${missing[*]}"
 )
 
 setup_ssh() (
@@ -312,8 +317,8 @@ setup_ssh() (
 setup_ssh_port() (
     set -e
     # 子 shell 隔离变量；不用 local，确保 EXIT 回滚时仍能读取备份信息。
-    socket='' backup='' changed=no firewall_changed=no
-    socket_config='' socket_existed=no
+    socket='' backup='' socket_config='' socket_existed=no
+    changed=no firewall_changed=no firewall_ports_before=''
     configs=(/etc/ssh/sshd_config)
 
     command -v sshd >/dev/null || { printf '未安装 OpenSSH 服务。\n'; exit 1; }
@@ -381,7 +386,7 @@ setup_ssh_port() (
             fi
             restart_ssh_port || true
             if [[ "$firewall_changed" == yes ]]; then
-                apply_firewall_rules "$backup/firewall"
+                apply_firewall_rules "$firewall_ports_before" || true
             fi
             printf "修改失败，已尝试恢复原配置。请检查 SSH 服务；备份：%s\n" "$backup" >&2
         fi
@@ -407,11 +412,10 @@ setup_ssh_port() (
         mkdir -p "${socket_config%/*}"
         printf '[Socket]\nListenStream=\nListenStream=%s\n' "$port" > "$socket_config"
     fi
-    # 启用本脚本防火墙后，先放行并持久化新 SSH 端口再重启服务。
-    if [[ -f /etc/vps-firewall/rules.v4 || -f /etc/vps-firewall/rules.v6 ]]; then
-        mkdir -p "$backup/firewall"
-        cp -p "/etc/vps-firewall/rules.v4" "/etc/vps-firewall/rules.v6" "$backup/firewall/"
-        update_firewall_port "$port" ACCEPT
+    # 启用本脚本防火墙后，先放行新 SSH 端口再重启服务，避免重启后失联。
+    if [[ -f "$ports_file" ]] && nft list table inet vps >/dev/null 2>&1; then
+        firewall_ports_before=$(read_allowed_ports)
+        apply_firewall_rules "$(printf '%s\n%s\n' "$firewall_ports_before" "$port")"
         firewall_changed=yes
     fi
     restart_ssh_port
@@ -493,16 +497,17 @@ run_probe() {
 }
 
 while true; do
-    printf '\nVPS 工具\n1) 开启 Root SSH 密码登录\n2) 配置 Swap\n3) 开启标准 BBR\n4) 一键启用 iptables 防火墙（放行 443 / SSH）\n5) 关闭指定端口（TCP / UDP）\n7) 系统与网站探针\n8) 修改 SSH 端口（随机 / 自定义）\n0) 退出\n'
-    IFS= read -r -u 3 -p '请选择 [1/2/3/4/5/7/8/0]: ' choice || break
+    printf '\nVPS 工具\n1) 替换 APT 源为国内镜像（清华）\n2) 一键更新并安装基础包\n3) 开启 Root SSH 密码登录\n4) 配置 Swap\n5) 开启标准 BBR\n6) 一键启用 nftables 防火墙（放行 443 / SSH）\n7) 修改 SSH 端口（随机 / 自定义）\n8) 系统与网站探针\n0) 退出\n'
+    IFS= read -r -u 3 -p '请选择 [1/2/3/4/5/6/7/8/0]: ' choice || break
     case "$choice" in
-        1) setup_ssh ;;
-        2) setup_swap ;;
-        3) enable_bbr ;;
-        4) enable_firewall ;;
-        5) close_firewall_port ;;
-        7) run_probe ;;
-        8) setup_ssh_port ;;
+        1) setup_apt_mirror ;;
+        2) install_base_packages ;;
+        3) setup_ssh ;;
+        4) setup_swap ;;
+        5) enable_bbr ;;
+        6) enable_firewall ;;
+        7) setup_ssh_port ;;
+        8) run_probe ;;
         0) break ;;
         *) printf '无效选项。\n' ;;
     esac
