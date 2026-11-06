@@ -1,13 +1,18 @@
 # Linux 服务器初始化脚本
 
-用于 Linux 服务器的交互式基础初始化，依次处理 Swap、Docker、1Panel 和防火墙。
-防火墙支持可选的中国 IP 访问限制、腾讯云 EdgeOne 回源例外，以及 IP 集自动更新和重启恢复。
+用于 Linux 服务器的交互式基础初始化，仓库按场景分成三个入口：
+
+- **[vps.sh](vps.sh)**：dd / 重装系统后的单文件工具，处理 APT 换源、基础包、SSH 登录方式、nftables 防火墙、Swap、BBR、时区校时和状态探针。无需克隆仓库，一条命令即可运行。
+- **[init_server.sh](init_server.sh)**：完整初始化，依次处理 Swap、Docker、1Panel 和防火墙。防火墙支持可选的中国 IP 访问限制、腾讯云 EdgeOne 回源例外，以及 IP 集自动更新和重启恢复。
+- **[install_cpa.sh](install_cpa.sh)**：交互式生成 CPA (CLI Proxy API) + CPA Manager Plus 的 `docker-compose.yaml`、配置、挂载目录和可选 nginx 反代配置，只写文件不启动容器。
 
 ## 脚本职责
 
 | 文件 | 用途 |
 | --- | --- |
+| [vps.sh](vps.sh) | dd 后精简系统的单文件工具：APT 国内镜像、基础包、账号密码 / 公钥 / 密码登录开关、Swap、BBR、nftables 防火墙、SSH 端口、时区校时、状态探针。 |
 | [init_server.sh](init_server.sh) | 总入口，检查并配置 Swap，按需安装 Docker、1Panel，再按发行版调用防火墙脚本。 |
+| [install_cpa.sh](install_cpa.sh) | 生成 CPA 与 CPA Manager Plus 的 compose 文件、`cpa-data/config.yaml`、挂载目录和可选 nginx 反代配置；只写文件，不启动容器。 |
 | [firewall/ubuntu_setup_firewall.sh](firewall/ubuntu_setup_firewall.sh) | Ubuntu / Debian 系列的 UFW 配置，管理 IPv4 / IPv6 入站规则、SSH 放行和禁止 Ping。 |
 | [firewall/centos_setup_firewall.sh](firewall/centos_setup_firewall.sh) | CentOS / RHEL / Rocky / Alibaba Cloud Linux 等系统的 firewalld 配置。 |
 | [firewall/firewall_common.sh](firewall/firewall_common.sh) | 防火墙共用逻辑：检查已有策略、独立询问跳过或覆盖、检测 SSH 端口、安装更新器、配置定时任务和启动恢复服务。 |
@@ -17,6 +22,28 @@
 `firewall_common.sh` 是供两个防火墙入口加载的函数库；`ipset_manager.py` 是配套更新器，通常由初始化脚本、定时任务或 systemd 调用。
 
 ## 使用方式
+
+### vps.sh：dd 后的精简系统
+
+单文件、无外部依赖，直接管道执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zhdgzs/init_server/main/vps.sh | sudo bash
+# 国内访问 raw 较慢时改用 jsDelivr
+curl -fsSL https://cdn.jsdelivr.net/gh/zhdgzs/init_server@main/vps.sh | sudo bash
+```
+
+脚本开头会 `exec 3<>/dev/tty`，菜单和密码都从终端 fd 3 读取，所以管道执行不会把脚本正文当成输入。
+需要 root 和真实终端（SSH 登录后运行）；在 cron、CI 等非交互环境会提示“需要交互终端”后退出。
+
+想先审阅再执行：
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/zhdgzs/init_server/main/vps.sh
+less vps.sh && sudo bash vps.sh
+```
+
+### init_server.sh：完整初始化（含防火墙策略）
 
 需完整保留仓库目录结构，在仓库根目录运行：
 
@@ -32,12 +59,87 @@ sudo bash "firewall/ubuntu_setup_firewall.sh"
 sudo bash "firewall/centos_setup_firewall.sh"
 ```
 
-运行条件：
+### install_cpa.sh：CPA 部署文件
+
+```bash
+sudo bash "install_cpa.sh"
+```
+
+默认在当前目录下生成 `cpa-deploy/`（也可指定其他目标目录，已存在时直接复用），内含：
+
+- `docker-compose.yaml`：`cli-proxy-api` 与 `cpa-manager-plus` 两个服务及 `cpa-network` 网络。
+- `cpa-data/config.yaml`：CPA 配置，默认密钥会提示尽快修改。
+- `cpa-data/{auths,logs,plugins}`、`cpa-manager-plus-data`：挂载目录。
+- 可选 nginx 反向代理配置，默认写入 `/etc/nginx/conf.d/cpa.conf`，按域名和证书目录替换模板。
+
+脚本**只写文件不启动容器**；同名文件已存在时跳过写入，保留现有内容。若检测到 `docker compose`，会额外执行一次 `config` 语法校验。
+
+### 运行条件
 
 - 使用 root 权限、Bash 和 systemd；防火墙入口通过 `apt`、`dnf` 或 `yum` 安装所需依赖。
+- `vps.sh` 面向使用 systemd 且内核带 nftables 的 Debian 11+ / Ubuntu 20.04+；APT 换源选项只处理 Debian。
 - 安装软件、下载网段和调用 EdgeOne API 时需要联网；选择安装 Docker / 1Panel 时需已有 `curl`。
 - 防火墙需要内核支持 ipset、IPv4 / IPv6 netfilter；不是 Windows、macOS 或通用容器初始化脚本。
 - 运行会实际修改主机配置。远程配置前，应确认 SSH 来源、SSH 端口以及业务和管理面板需要开放的端口。
+
+## vps.sh 功能
+
+菜单共 11 项，所有修改类操作都在独立子 shell 中执行，单项失败只退出该功能，不会让整个菜单崩溃。
+
+| 选项 | 功能 | 说明 |
+| --- | --- | --- |
+| 1 | 替换 APT 源为国内镜像 | 写入 deb822 格式的 `/etc/apt/sources.list.d/debian.sources`：清华 `debian` 与 `security.debian.org`，suite 取自 `/etc/os-release` 的 `VERSION_CODENAME`。已是目标内容时逐字节比对后直接跳过。 |
+| 2 | 一键更新并安装基础包 | 只安装缺失的包，带 dpkg 锁等待与非交互模式。 |
+| 3 | 设置账号密码（同时开启密码登录） | 账号默认 `root`，登录 shell 为 `nologin` / `false` 时提前警告；只有目标是 root 才动 `PermitRootLogin`。 |
+| 4 | 添加登录公钥（密钥登录） | 用 `ssh-keygen` 实际解析公钥、拒绝私钥、按 key blob 去重；仅当策略真的禁止密钥登录时才改 sshd 配置。 |
+| 5 | 密码登录开关（关闭前校验密钥） | 关闭前必须已存在至少一个授权公钥，否则拒绝执行；同时关闭 `KbdInteractiveAuthentication`，避免 PAM 继续接受密码。 |
+| 6 | 配置 Swap | 默认 `2 GB`，用 `dd` 创建 `/swapfile`，写入 fstab 与 `vm.swappiness=10`，保留其他交换分区。 |
+| 7 | 开启标准 BBR | 写入 `fq` + `bbr`，并清理 `/etc/sysctl.conf` 中的重复旧设置。 |
+| 8 | 一键启用 nftables 防火墙 | 只放行 TCP 443 与检测到的 SSH 端口，其余入站默认丢弃。 |
+| 9 | 修改 SSH 端口 | 随机端口在 49152-65535 未监听范围内选取，也可手输；兼容 `sshd.service` 与 `ssh.socket`。 |
+| 10 | 时区与自动校时 | 显示现状后设置时区（默认 `Asia/Shanghai`）并启用 chrony / systemd-timesyncd，最多等 20 秒复核同步状态。 |
+| 11 | 系统与网站探针 | 内核、CPU、内存、磁盘、拥塞控制算法，以及 Gemini / YouTube / Netflix 的 HTTP 状态。 |
+
+### APT 换源与 ca-certificates
+
+全新系统常常没有 `ca-certificates`，https 源会直接卡在证书校验。选项 1 的顺序是：
+
+1. 校验发行版为 Debian、版本代号有效、`debian-archive-keyring` 存在。
+2. 渲染目标内容并与现有 `debian.sources` 逐字节比对，同时确认 `/etc/apt/sources.list` 里没有生效的源定义；都满足则直接返回。
+3. 缺 CA 时先写清华 **http** 镜像，`apt-get update` 可用后从该镜像安装 `ca-certificates`，再升级为 https 并再次验证。全程不依赖国内访问缓慢的官方源。
+4. 验证 `apt-get update`：退出码非零，或输出中出现 `E:` / `Err:` / `W: Failed to fetch` 都算失败，此时还原两个文件和包索引。
+5. CA 安装失败时保留已验证可用的 http 镜像；https 验证失败时优先回退 http，只有 http 也不可用才整体回滚。
+
+原文件只在首次运行时备份为 `<文件>.vps.bak`，重复执行不会覆盖原件。
+
+### nftables 防火墙
+
+只声明自己的 `table inet vps`，不 flush 整个规则集，Docker、面板等其他工具的表不受影响：
+
+- `chain input`：`hook input priority -10`，`policy drop`，等价于“排在其他入站规则之前 + 末尾丢弃”。
+- 固定放行回环、`ESTABLISHED,RELATED`，丢弃 `INVALID`，放行 ICMP / ICMPv6 与 DHCPv4 / DHCPv6 回包。
+- `/etc/vps-firewall/ports.list` 是放行端口的唯一数据源，`rules.nft` 由它生成；渲染后先 `nft -c -f` 预检，再 `nft -f` 一次提交原子替换。
+- `vps-firewall.service` 在 `network-pre.target` 之前 `nft -f rules.nft` 恢复规则。
+- `ufw` / `firewalld` / `nftables` / `netfilter-persistent` 任一在运行则拒绝执行，避免两套策略互相覆盖。
+
+放行端口固定为 TCP 443 加检测到的 SSH 端口。`detect_ssh_ports` 会合并 `sshd -T` 的 `port` / `listenaddress`、`ss -ltnp` 中 sshd 的实际监听、socket 激活端口和当前会话端口。
+重复执行选项 8 会把放行列表重置为“443 + 当前 SSH 端口”，因此手工加入的额外端口不会保留。
+
+调整 SSH 端口时先放行新端口再重启 sshd；若验证失败，由 `trap` 还原 sshd 配置、重启服务并恢复原防火墙端口列表。
+
+### vps.sh 生成的文件
+
+| 路径 | 用途 |
+| --- | --- |
+| `/etc/apt/sources.list.d/debian.sources`、`/etc/apt/sources.list` | 选项 1 写入的镜像源；首次运行前生成 `.vps.bak` 备份。 |
+| `/root/.ssh/authorized_keys` | 选项 4 追加的登录公钥，目录 `0700`、文件 `0600`。 |
+| `/etc/ssh/sshd_config`、`/etc/ssh/sshd_config.d/*.conf` | 选项 3 / 4 / 5 调整的登录策略，修改前备份为 `.bak`；选项 9 的备份位于 `/etc/ssh/vps-port-backup.*`。 |
+| `/swapfile`、`/etc/fstab`、`/etc/sysctl.d/99-swap.conf` | 选项 6 创建的 Swap、启动挂载项和 `vm.swappiness`。 |
+| `/etc/sysctl.d/99-bbr.conf`、`/etc/sysctl.conf` | 选项 7 写入的 BBR 参数；`/etc/sysctl.conf` 中重复项会被删除并备份。 |
+| `/etc/vps-firewall/ports.list`、`/etc/vps-firewall/rules.nft` | 选项 8 的放行端口列表与生成的 nftables 规则，权限 `0600`。 |
+| `/etc/systemd/system/vps-firewall.service` | 开机恢复 nftables 规则的服务。 |
+
+这些规则只作用于本机 INPUT，不覆盖 Docker 映射端口等 FORWARD 流量，也不修改云安全组。
 
 ## 总入口执行流程
 
@@ -197,7 +299,7 @@ sudo python3 "/usr/local/lib/init-server-firewall/ipset_manager.py" update --sou
 
 首次获取数据失败会中止初始化。启用地域限制前，应确保管理端来源属于中国网段，否则当前 SSH 会话虽然保留，新连接仍可能被阻止。
 
-## 运行后生成的文件
+## init_server.sh 运行后生成的文件
 
 | 路径 | 用途 |
 | --- | --- |
@@ -217,7 +319,18 @@ firewalld 入口通过 `firewall-cmd --permanent` 保存规则，使用 `INIT_SE
 
 ## 查看状态与语法检查
 
-可按系统查看当前规则和更新日志：
+`vps.sh` 相关状态：
+
+```bash
+sudo nft list table inet vps
+sudo cat "/etc/vps-firewall/ports.list"
+sudo systemctl status vps-firewall.service
+sudo sshd -T | grep -Ei '^(passwordauthentication|permitrootlogin|pubkeyauthentication|kbdinteractiveauthentication) '
+sudo ssh-keygen -lf "/root/.ssh/authorized_keys"
+sudo cat "/etc/apt/sources.list.d/debian.sources"
+```
+
+`init_server.sh` / 防火墙脚本可按系统查看当前规则和更新日志：
 
 ```bash
 sudo ufw status verbose
@@ -235,5 +348,5 @@ sudo tail -n 50 "/var/log/ipset-update.log"
 只检查 Bash 语法，不执行初始化：
 
 ```bash
-bash -n "init_server.sh" "firewall/firewall_common.sh" "firewall/ubuntu_setup_firewall.sh" "firewall/centos_setup_firewall.sh"
+bash -n "init_server.sh" "vps.sh" "install_cpa.sh" "firewall/firewall_common.sh" "firewall/ubuntu_setup_firewall.sh" "firewall/centos_setup_firewall.sh"
 ```
