@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# VPS 工具：APT 国内镜像、Root SSH 登录、SSH 端口、nftables 防火墙、Swap、标准 BBR、状态探针。
+# VPS 工具：APT 国内镜像、基础包、账号密码、ssh 公钥、密码登录开关、SSH 端口、nftables 防火墙、Swap、BBR、时区校时、状态探针。
 # 适用于使用 systemd 且内核带 nft 的 Debian 11+ / Ubuntu 20.04+；支持 curl -fsSL URL | sudo bash。
 
 if (( EUID != 0 )); then
@@ -29,9 +29,10 @@ ssh_service_name() {
     fi
 }
 
-confirm_firewall_change() {
+# 通用危险操作确认：操作类型、影响范围、风险评估。
+confirm_danger() {
     local answer
-    printf '\n⚠️ 危险操作检测！\n操作类型：%s\n影响范围：本机 nftables 「inet vps」 规则表（IPv4 / IPv6）及开机恢复服务。\n风险评估：%s\n' "$1" "$2"
+    printf '\n⚠️ 危险操作检测！\n操作类型：%s\n影响范围：%s\n风险评估：%s\n' "$1" "$2" "$3"
     IFS= read -r -u 3 -p '请确认是否继续？[是/确认/继续，其他输入取消]: ' answer || return 1
     [[ "$answer" == 是 || "$answer" == 确认 || "$answer" == 继续 ]]
 }
@@ -155,7 +156,8 @@ enable_firewall() (
     printf '将放行 TCP 443 和以下 SSH TCP 端口：\n%s\n' "$ssh_ports"
     printf '其他本机新入站端口（包括 80）将被关闭；保留回环、已有连接、ICMP 和 DHCP。\n'
     printf '本脚本只写自己的 table，出站、转发、Docker 映射端口及云安全组需另行管理。\n'
-    confirm_firewall_change '启用 nftables 防火墙（缺少 nft 时安装 nftables）' \
+    confirm_danger '启用 nftables 防火墙（缺少 nft 时安装 nftables）' \
+        '本机 nftables 「inet vps」 规则表（IPv4 / IPv6）及开机恢复服务。' \
         '规则表为默认丢弃，其他入站服务将无法新建连接；重复启用不会累积规则。' || exit 0
     if ! command -v nft >/dev/null; then
         apt-get update
@@ -333,31 +335,234 @@ install_base_packages() (
     printf '基础包安装完成：%s\n' "${missing[*]}"
 )
 
+# 开启 SSH 密码登录：给目标账号设密码 + 全局打开 PasswordAuthentication；
+# 只有目标账号是 root 时才动 PermitRootLogin。
 setup_ssh() (
-    set -e
-    local password config=/etc/ssh/sshd_config service=ssh
+    set -e -o pipefail
+    config=/etc/ssh/sshd_config
+    user=root
+    password=''
+    target_uid=''
+    target_shell=''
 
-    command -v sshd >/dev/null || { printf '未安装 OpenSSH 服务。\n'; exit 1; }
+    command -v sshd >/dev/null || { printf '未安装 OpenSSH 服务。\n' >&2; exit 1; }
     sshd -t
-    IFS= read -r -u 3 -p '请输入新的 root 密码: ' password
+    printf '当前 sshd：PermitRootLogin=%s PasswordAuthentication=%s\n' \
+        "$(sshd -T | awk '$1 == "permitrootlogin" {print $2}')" \
+        "$(sshd -T | awk '$1 == "passwordauthentication" {print $2}')"
+
+    IFS= read -r -u 3 -p '请输入要设置密码的账号（回车使用 root）: ' user
+    user=${user:-root}
+    [[ "$user" =~ ^[[:alpha:]_][[:alnum:]_-]*$ ]] || { printf '账号名不合法：%s\n' "$user" >&2; exit 1; }
+    if ! target_uid=$(id -u "$user" 2>/dev/null); then
+        printf '账号 %s 不存在。\n' "$user" >&2
+        exit 1
+    fi
+    target_shell=$(awk -F: -v u="$user" '$1 == u {print $7}' /etc/passwd)
+    if [[ "$target_shell" == */nologin || "$target_shell" == */false ]]; then
+        printf '注意：%s 的登录 shell 是 %s，密码登录会被拒绝，需先 chsh。\n' "$user" "$target_shell" >&2
+    fi
+
+    IFS= read -r -u 3 -p "请输入 $user 的新密码: " password
     printf '\n'
-    [[ -n "$password" ]] || { printf '密码不能为空。\n'; exit 1; }
-    printf 'root:%s\n' "$password" | chpasswd
+    [[ -n "$password" ]] || { printf '密码不能为空。\n' >&2; exit 1; }
+    # 密码只经 stdin 传给 chpasswd，不落盘；设置密码同时会解除账号锁定。
+    printf '%s:%s\n' "$user" "$password" | chpasswd
     unset password
 
     cp -p "$config" "${config}.bak"
-    # 将全局设置置于 Include 和 Match 之前，兼容云服务器配置。
-    sed -i '/^[[:space:]]*PermitRootLogin[[:space:]]/d; /^[[:space:]]*PasswordAuthentication[[:space:]]/d' "$config"
-    sed -i '1i PermitRootLogin yes\nPasswordAuthentication yes' "$config"
+    # 全局设置置于 Include 和 Match 之前，兼容云服务器配置。
+    sed -i '/^[[:space:]]*PasswordAuthentication[[:space:]]/d' "$config"
+    sed -i '1i PasswordAuthentication yes' "$config"
+    if [[ "$target_uid" == 0 ]]; then
+        sed -i '/^[[:space:]]*PermitRootLogin[[:space:]]/d' "$config"
+        sed -i '1i PermitRootLogin yes' "$config"
+    fi
     if ! sshd -t; then
         cp -p "${config}.bak" "$config"
         printf 'SSH 配置验证失败，已恢复原配置。\n' >&2
         exit 1
     fi
 
-    service=$(ssh_service_name)
-    systemctl restart "$service"
-    printf 'Root 密码登录已启用，原配置备份：%s.bak\n' "$config"
+    systemctl restart "$(ssh_service_name)"
+    printf 'SSH 密码登录已开启，账号 %s 的密码已更新。\n' "$user"
+    if [[ "$target_uid" != 0 ]]; then
+        printf '未改动 PermitRootLogin（当前：%s），root 仍按原策略。\n' \
+            "$(sshd -T | awk '$1 == "permitrootlogin" {print $2}')"
+    fi
+    printf '原配置备份：%s.bak\n' "$config"
+)
+
+# 添加 root 登录公钥；authorized_keys 即时生效，只有改 sshd 配置才重启服务。
+setup_ssh_key() (
+    set -e -o pipefail
+    config=/etc/ssh/sshd_config
+    keys_dir=/root/.ssh
+    keys_file=$keys_dir/authorized_keys
+    key='' blob='' fingerprint='' tmp=''
+    permit='' pubkey='' keys_conf=''
+    config_changed=no
+
+    command -v sshd >/dev/null || { printf '未安装 OpenSSH 服务。\n' >&2; exit 1; }
+    command -v ssh-keygen >/dev/null || { printf '缺少 ssh-keygen，请先安装 openssh-client。\n' >&2; exit 1; }
+    sshd -t
+
+    IFS= read -r -u 3 -p '请粘贴公钥（ssh-ed25519 / ssh-rsa / ecdsa- 开头）: ' key
+    # 去掉误粘的引号和首尾空白。
+    key=$(printf '%s' "$key" | tr -d '\042\047' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    [[ -n "$key" ]] || { printf '公钥不能为空。\n' >&2; exit 1; }
+    [[ "$key" == -----BEGIN* ]] && { printf '这是私钥，请粘贴对应的 .pub 公钥。\n' >&2; exit 1; }
+
+    # 用 ssh-keygen 真正解析一遍，不靠正则猜格式。
+    tmp=$(mktemp)
+    trap 'rm -f "$tmp"' EXIT
+    printf '%s\n' "$key" > "$tmp"
+    if ! fingerprint=$(ssh-keygen -l -f "$tmp" 2>/dev/null); then
+        printf '公钥无法解析，请确认复制完整（类型 + base64 + 可选注释）。\n' >&2
+        exit 1
+    fi
+    blob=$(awk 'NR == 1 {print $2}' "$tmp")
+    [[ -n "$blob" ]] || { printf '公钥无法解析。\n' >&2; exit 1; }
+
+    if [[ -f "$keys_file" ]] && awk -v b="$blob" '{for (i = 1; i <= NF; i++) if ($i == b) found = 1} END {exit !found}' "$keys_file"; then
+        printf '该公钥已在 %s 中，不重复写入。\n' "$keys_file"
+    else
+        install -d -m 700 -o root -g root "$keys_dir"
+        [[ -f "$keys_file" ]] || install -m 600 -o root -g root /dev/null "$keys_file"
+        chown root:root "$keys_dir" "$keys_file"
+        chmod 700 "$keys_dir"
+        chmod 600 "$keys_file"
+        printf '%s\n' "$key" >> "$keys_file"
+        printf '已写入公钥：%s\n' "$fingerprint"
+    fi
+
+    # 只有在策略真的禁止密钥登录时才改配置，不覆盖选项 3 写入的 PermitRootLogin yes。
+    permit=$(sshd -T | awk '$1 == "permitrootlogin" {print $2}')
+    pubkey=$(sshd -T | awk '$1 == "pubkeyauthentication" {print $2}')
+    keys_conf=$(sshd -T | awk '$1 == "authorizedkeysfile" {$1 = ""; print}')
+    if [[ "$keys_conf" != *".ssh/authorized_keys"* && "$keys_conf" != *"$keys_file"* ]]; then
+        printf '注意：AuthorizedKeysFile 被改为%s，公钥可能不在 %s 生效。\n' "$keys_conf" "$keys_file" >&2
+    fi
+    if [[ "$permit" == no || "$pubkey" == no ]]; then
+        cp -p "$config" "${config}.bak"
+        if [[ "$permit" == no ]]; then
+            printf '当前 PermitRootLogin=no，root 无法用密钥登录，改为 prohibit-password。\n'
+            sed -i '/^[[:space:]]*PermitRootLogin[[:space:]]/d' "$config"
+            sed -i '1i PermitRootLogin prohibit-password' "$config"
+        fi
+        if [[ "$pubkey" == no ]]; then
+            printf '当前 PubkeyAuthentication=no，改为 yes。\n'
+            sed -i '/^[[:space:]]*PubkeyAuthentication[[:space:]]/d' "$config"
+            sed -i '1i PubkeyAuthentication yes' "$config"
+        fi
+        if ! sshd -t; then
+            cp -p "${config}.bak" "$config"
+            printf 'SSH 配置验证失败，已恢复原配置。\n' >&2
+            exit 1
+        fi
+        config_changed=yes
+    fi
+    if [[ "$config_changed" == yes ]]; then
+        systemctl restart "$(ssh_service_name)"
+        printf 'SSH 配置已生效，原配置备份：%s.bak\n' "$config"
+    fi
+
+    printf '请保留当前会话，另开终端验证：ssh -i 私钥 root@服务器IP\n'
+    printf '确认密钥可登录后，如需只允许密钥，可把 PasswordAuthentication 改为 no。\n'
+)
+
+# 列出已配置的授权公钥：每行「数量<tab>文件」，没有则无输出。
+list_authorized_keys() {
+    local file count
+    for file in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
+        [[ -f "$file" ]] || continue
+        count=$(grep -cE '(ssh-(rsa|ed25519|dss)|ecdsa-sha2-|sk-ssh-|sk-ecdsa-)' "$file" 2>/dev/null) || count=0
+        (( count > 0 )) || continue
+        printf '%s\t%s\n' "$count" "$file"
+    done
+}
+
+# 开启 / 关闭全局密码登录；关闭前必须确认已有可用公钥，避免把自己锁在门外。
+ssh_password_toggle() (
+    set -e -o pipefail
+    config=/etc/ssh/sshd_config
+    current='' choice='' key_info='' new_value='' action='' kbd=''
+
+    command -v sshd >/dev/null || { printf '未安装 OpenSSH 服务。\n' >&2; exit 1; }
+    sshd -t
+    current=$(sshd -T | awk '$1 == "passwordauthentication" {print $2}')
+    key_info=$(list_authorized_keys)
+
+    printf '\n当前 PasswordAuthentication=%s，PermitRootLogin=%s\n' \
+        "$current" "$(sshd -T | awk '$1 == "permitrootlogin" {print $2}')"
+    if [[ -n "$key_info" ]]; then
+        printf '已存在的授权公钥：\n'
+        while IFS=$'\t' read -r count file; do printf '  %s（%s 个）\n' "$file" "$count"; done <<< "$key_info"
+    else
+        printf '已存在的授权公钥：无\n'
+    fi
+
+    printf '1) 开启密码登录\n2) 关闭密码登录（仅允许密钥）\n'
+    IFS= read -r -u 3 -p '请选择 [1/2]: ' choice
+
+    case "$choice" in
+        1)
+            if [[ "$current" == yes ]]; then
+                printf '密码登录已经是开启状态，无需修改。\n'
+                exit 0
+            fi
+            if awk -F: '$1 == "root" {print $2}' /etc/shadow | grep -qE '^(!|\*)'; then
+                printf '注意：root 没有可用密码，开启后只有设过密码的账号能用密码登录。\n' >&2
+                printf '需要 root 也能用密码登录，请先走菜单 3。\n' >&2
+            fi
+            new_value=yes
+            action='开启'
+            ;;
+        2)
+            if [[ "$current" == no ]]; then
+                printf '密码登录已经是关闭状态，无需修改。\n'
+                exit 0
+            fi
+            if [[ -z "$key_info" ]]; then
+                printf '\n未检测到任何授权公钥（/root/.ssh/authorized_keys、/home/*/.ssh/authorized_keys）。\n' >&2
+                printf '此时关闭密码登录会导致无法登录，已取消。请先用菜单 4 添加公钥。\n' >&2
+                exit 1
+            fi
+            confirm_danger '关闭 SSH 密码登录' \
+                'sshd 只接受密钥认证；未配置公钥的账号将无法登录。' \
+                '当前会话不会中断，但新连接全靠密钥；请先确认密钥能登录。' || exit 0
+            new_value=no
+            action='关闭'
+            ;;
+        *)
+            printf '已取消。\n'
+            exit 0
+            ;;
+    esac
+
+    cp -p "$config" "${config}.bak"
+    sed -i '/^[[:space:]]*PasswordAuthentication[[:space:]]/d' "$config"
+    sed -i "1i PasswordAuthentication $new_value" "$config"
+    if [[ "$new_value" == no ]]; then
+        # Keyboard-interactive 走 PAM，也可能接受密码，一并关掉才算“仅密钥”。
+        kbd=$(sshd -T | awk '$1 == "kbdinteractiveauthentication" {print $2}')
+        if [[ "$kbd" == yes ]]; then
+            printf '同时关闭 KbdInteractiveAuthentication（PAM 仍可能接受密码）。\n'
+            sed -i '/^[[:space:]]*KbdInteractiveAuthentication[[:space:]]/d' "$config"
+            sed -i '1i KbdInteractiveAuthentication no' "$config"
+        fi
+    fi
+    if ! sshd -t; then
+        cp -p "${config}.bak" "$config"
+        printf 'SSH 配置验证失败，已恢复原配置。\n' >&2
+        exit 1
+    fi
+    systemctl restart "$(ssh_service_name)"
+    printf 'SSH 密码登录已%s（PasswordAuthentication %s），原配置备份：%s.bak\n' \
+        "$action" "$new_value" "$config"
+    if [[ "$new_value" == no ]]; then
+        printf '请保留当前会话，另开终端用密钥验证一次登录。\n'
+    fi
 )
 
 setup_ssh_port() (
@@ -515,6 +720,94 @@ enable_bbr() (
     printf '标准 BBR 已开启。\n'
 )
 
+# 时区与自动校时：显示现状 → 设置时区 → 启用校时服务 → 复核。
+setup_time_sync() (
+    set -e -o pipefail
+    tz_default=Asia/Shanghai
+    ntp_service=''
+    synced=no
+    current_tz=''
+    local_rtc=''
+
+    command -v timedatectl >/dev/null || { printf '缺少 timedatectl，需要 systemd 环境。\n' >&2; exit 1; }
+    [[ -d /usr/share/zoneinfo ]] || { printf '缺少 /usr/share/zoneinfo，请先安装 tzdata。\n' >&2; exit 1; }
+
+    current_tz=$(timedatectl show -p Timezone --value 2>/dev/null || true)
+    local_rtc=$(timedatectl show -p LocalRTC --value 2>/dev/null || true)
+    printf '\n[当前状态]\n'
+    printf '时区：%s\n' "${current_tz:-未知}"
+    printf '本地时间：%s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+    printf 'UTC 时间：%s\n' "$(date -u '+%Y-%m-%d %H:%M:%S')"
+    printf '自动校时：%s（已同步：%s）\n' \
+        "$(timedatectl show -p NTP --value 2>/dev/null || true)" \
+        "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
+    if [[ "$local_rtc" == yes ]]; then
+        printf '硬件时钟：本地时间（服务器建议 timedatectl set-local-rtc 0 改回 UTC）\n'
+    else
+        printf '硬件时钟：UTC\n'
+    fi
+
+    IFS= read -r -u 3 -p "请输入时区（回车使用 $tz_default）: " tz
+    tz=${tz:-$tz_default}
+    [[ -f "/usr/share/zoneinfo/$tz" ]] || {
+        printf '无效时区：%s（可用 timedatectl list-timezones 查看）。\n' "$tz" >&2
+        exit 1
+    }
+    if [[ "$tz" == "$current_tz" ]]; then
+        printf '时区已经是 %s。\n' "$tz"
+    else
+        timedatectl set-timezone "$tz"
+        printf '时区已设置为 %s。\n' "$tz"
+    fi
+
+    for svc in chrony chronyd systemd-timesyncd ntpsec ntp; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then ntp_service=$svc; break; fi
+    done
+    if [[ -z "$ntp_service" ]]; then
+        printf '未发现运行中的校时服务，尝试启用 systemd-timesyncd。\n'
+        if ! systemctl enable --now systemd-timesyncd 2>/dev/null; then
+            command -v apt-get >/dev/null || {
+                printf '无法启用校时服务，请手动安装 chrony 或 systemd-timesyncd。\n' >&2
+                exit 1
+            }
+            DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y systemd-timesyncd
+            systemctl enable --now systemd-timesyncd
+        fi
+        ntp_service=systemd-timesyncd
+    fi
+
+    case "$ntp_service" in
+        chrony|chronyd)
+            systemctl enable --now "$ntp_service"
+            if command -v chronyc >/dev/null; then chronyc -a makestep >/dev/null 2>&1 || true; fi
+            ;;
+        *)
+            systemctl enable --now "$ntp_service" 2>/dev/null || true
+            timedatectl set-ntp true || printf 'timedatectl set-ntp 未成功，请检查 %s 状态。\n' "$ntp_service" >&2
+            ;;
+    esac
+
+    # 首次同步常常要几十秒，最多等 20 秒，等不到就如实汇报而不是报错。
+    for ((i = 0; i < 20; i++)); do
+        if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == yes ]]; then synced=yes; break; fi
+        if command -v chronyc >/dev/null 2>&1 && chronyc tracking 2>/dev/null | grep -q 'Leap status *: *Normal'; then
+            synced=yes
+            break
+        fi
+        sleep 1
+    done
+
+    printf '\n[结果]\n'
+    printf '时区：%s\n' "$(timedatectl show -p Timezone --value 2>/dev/null || printf '%s' "$tz")"
+    printf '本地时间：%s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+    printf '校时服务：%s\n' "$ntp_service"
+    if [[ "$synced" == yes ]]; then
+        printf '同步状态：已同步\n'
+    else
+        printf '同步状态：尚未确认（首次同步常需几十秒，稍后用 timedatectl 或 chronyc tracking 复查）\n'
+    fi
+)
+
 check_site() {
     local code
     code=$(curl -sSL --connect-timeout 3 --max-time 8 -o /dev/null -w '%{http_code}' "$1") || {
@@ -543,17 +836,20 @@ run_probe() {
 }
 
 while true; do
-    printf '\nVPS 工具\n1) 替换 APT 源为国内镜像（清华）\n2) 一键更新并安装基础包\n3) 开启 Root SSH 密码登录\n4) 配置 Swap\n5) 开启标准 BBR\n6) 一键启用 nftables 防火墙（放行 443 / SSH）\n7) 修改 SSH 端口（随机 / 自定义）\n8) 系统与网站探针\n0) 退出\n'
-    IFS= read -r -u 3 -p '请选择 [1/2/3/4/5/6/7/8/0]: ' choice || break
+    printf '\nVPS 工具\n1) 替换 APT 源为国内镜像（清华）\n2) 一键更新并安装基础包\n3) 设置账号密码（同时开启密码登录）\n4) 添加登录公钥（密钥登录）\n5) 密码登录开关（关闭前校验密钥）\n6) 配置 Swap\n7) 开启标准 BBR\n8) 一键启用 nftables 防火墙（放行 443 / SSH）\n9) 修改 SSH 端口（随机 / 自定义）\n10) 时区与自动校时\n11) 系统与网站探针\n0) 退出\n'
+    IFS= read -r -u 3 -p '请选择 [1-11/0]: ' choice || break
     case "$choice" in
         1) setup_apt_mirror ;;
         2) install_base_packages ;;
         3) setup_ssh ;;
-        4) setup_swap ;;
-        5) enable_bbr ;;
-        6) enable_firewall ;;
-        7) setup_ssh_port ;;
-        8) run_probe ;;
+        4) setup_ssh_key ;;
+        5) ssh_password_toggle ;;
+        6) setup_swap ;;
+        7) enable_bbr ;;
+        8) enable_firewall ;;
+        9) setup_ssh_port ;;
+        10) setup_time_sync ;;
+        11) run_probe ;;
         0) break ;;
         *) printf '无效选项。\n' ;;
     esac
